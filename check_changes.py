@@ -10,16 +10,35 @@ import binascii
 import json
 import os
 import sys
+import time
 import hashlib
 import gspread
+from gspread.utils import absolute_range_name, fill_gaps
 import requests
 from datetime import datetime
 import pytz
+from google.auth.transport.requests import AuthorizedSession
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 
 # Constants
 HASH_FILE = 'last_source_hash.json'
+MAX_RETRIES = 4
+RETRYABLE_STATUS_CODES = (429, 500, 502, 503, 504)
+
+def api_call_with_retry(func, *args, **kwargs):
+    """Call a Sheets API function, retrying 429/5xx errors with exponential backoff."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            return func(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            status = e.response.status_code
+            if status in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES - 1:
+                wait = 5 * (2 ** attempt)
+                print(f"⚠️ API error {status}, retrying in {wait}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                time.sleep(wait)
+            else:
+                raise
 
 def load_env_file():
     """Load environment variables from .env file if it exists."""
@@ -108,12 +127,24 @@ def get_source_data_hash(spreadsheet_id, credentials, source_worksheets):
         spreadsheet = gc.open_by_key(spreadsheet_id)
         print(f"✅ Opened spreadsheet successfully")
 
+        existing_titles = {ws.title for ws in api_call_with_retry(spreadsheet.worksheets)}
+        found_worksheets = []
+        for worksheet_name in source_worksheets:
+            if worksheet_name in existing_titles:
+                found_worksheets.append(worksheet_name)
+            else:
+                print(f"⚠️ Worksheet not found, skipping")
+
         combined_content = []
 
-        for worksheet_name in source_worksheets:
-            try:
-                worksheet = spreadsheet.worksheet(worksheet_name)
-                all_values = worksheet.get_all_values()
+        if found_worksheets:
+            # Single batchGet for all tabs instead of 2 requests per tab
+            ranges = [absolute_range_name(name) for name in found_worksheets]
+            response = api_call_with_retry(spreadsheet.values_batch_get, ranges)
+
+            for worksheet_name, value_range in zip(found_worksheets, response.get('valueRanges', [])):
+                # Same padding as get_all_values() so the stored hash stays valid
+                all_values = fill_gaps(value_range.get('values', [[]]))
 
                 # Add worksheet content to combined content
                 combined_content.append({
@@ -123,10 +154,6 @@ def get_source_data_hash(spreadsheet_id, credentials, source_worksheets):
 
                 rows_with_data = len([row for row in all_values if any(cell.strip() for cell in row)])
                 print(f"📊 {worksheet_name}: {rows_with_data} rows with data")
-
-            except gspread.WorksheetNotFound:
-                print(f"⚠️ Worksheet not found, skipping")
-                continue
 
         # Create hash of combined content
         content_str = str(combined_content)
@@ -146,24 +173,36 @@ def get_source_data_hash(spreadsheet_id, credentials, source_worksheets):
         print(f"❌ Error accessing spreadsheet data")
         sys.exit(1)
 
-def load_last_hash():
-    """Load the last processed content hash from file."""
+def get_drive_modified_time(spreadsheet_id, credentials):
+    """Get the spreadsheet's Drive modifiedTime (cheap pre-check, separate quota)."""
+    session = AuthorizedSession(credentials)
+    response = session.get(
+        f"https://www.googleapis.com/drive/v3/files/{spreadsheet_id}",
+        params={'fields': 'modifiedTime', 'supportsAllDrives': 'true'},
+        timeout=30
+    )
+    response.raise_for_status()
+    return response.json()['modifiedTime']
+
+def load_state():
+    """Load the last processed state (content hash + Drive modifiedTime) from file."""
     try:
         if os.path.exists(HASH_FILE):
             with open(HASH_FILE, 'r') as f:
-                data = json.load(f)
-                return data.get('content_hash')
-        return None
+                return json.load(f)
+        return {}
     except Exception as e:
         print(f"⚠️ Warning: Could not load last hash: {e}")
-        return None
+        return {}
 
-def save_hash(content_hash):
-    """Save the current content hash to file."""
+def save_state(content_hash, modified_time=None):
+    """Save the current content hash and Drive modifiedTime to file."""
     try:
         data = {
             'content_hash': content_hash
         }
+        if modified_time:
+            data['modified_time'] = modified_time
         with open(HASH_FILE, 'w') as f:
             json.dump(data, f, indent=2)
         print(f"💾 Saved new content hash")
@@ -267,11 +306,27 @@ def main():
         # Get credentials
         credentials = get_credentials()
 
+        # Load last processed state
+        state = load_state()
+        last_hash = state.get('content_hash')
+        last_modified = state.get('modified_time')
+
+        # Drive modifiedTime early exit: the service account never writes to this
+        # file, so an unchanged modifiedTime means unchanged content. Fail open on
+        # any error and fall through to the full hash check.
+        current_modified = None
+        try:
+            current_modified = get_drive_modified_time(spreadsheet_id, credentials)
+            if last_hash and last_modified and current_modified == last_modified:
+                print("⏭️ No changes in source data detected. Skipping update.")
+                print("NEEDS_UPDATE=false")
+                return False
+        except Exception as e:
+            print(f"⚠️ Warning: Drive modifiedTime check failed, falling back to hash check: {e}")
+
         # Get current source data hash
         current_hash = get_source_data_hash(spreadsheet_id, credentials, source_worksheets)
 
-        # Load last processed hash
-        last_hash = load_last_hash()
         if last_hash:
             print(f"📅 Previous check completed")
         else:
@@ -280,7 +335,7 @@ def main():
         # Compare hashes
         if current_hash != last_hash:
             print("✅ Source data changes detected! Update needed.")
-            save_hash(current_hash)
+            save_state(current_hash, current_modified)
 
             # Send Google Chat notification
             send_google_chat_notification(source_worksheets, spreadsheet_id)
@@ -288,6 +343,10 @@ def main():
             print("NEEDS_UPDATE=true")
             return True
         else:
+            # Content unchanged; remember the new modifiedTime so the cheap
+            # gate can short-circuit future runs
+            if current_modified and current_modified != last_modified:
+                save_state(current_hash, current_modified)
             print("⏭️ No changes in source data detected. Skipping update.")
             print("NEEDS_UPDATE=false")
             return False
